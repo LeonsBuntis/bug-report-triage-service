@@ -1,0 +1,105 @@
+services:
+  gitea:
+    image: docker.gitea.com/gitea:1.27.2
+    container_name: gitea
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__server__DOMAIN=localhost
+      - GITEA__server__ROOT_URL=http://localhost:3000/
+      - GITEA__service__DISABLE_REGISTRATION=true
+      # Dev-only relaxation so a scripted seed password doesn't need to satisfy prod policy.
+      - GITEA__security__PASSWORD_COMPLEXITY=off
+    restart: unless-stopped
+    volumes:
+      - gitea-data:/data
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # One-shot: creates the admin account the seed step authenticates as.
+  gitea-init:
+    image: docker.gitea.com/gitea:1.27.2
+    depends_on:
+      gitea:
+        condition: service_healthy
+    volumes:
+      - gitea-data:/data
+    environment:
+      - GITEA_ADMIN_USER=${GITEA_ADMIN_USER}
+      - GITEA_ADMIN_PASSWORD=${GITEA_ADMIN_PASSWORD}
+      - GITEA_ADMIN_EMAIL=${GITEA_ADMIN_EMAIL}
+    # No custom entrypoint: keep the image's default, which just execs this command as
+    # root - so we drop to the "git" user ourselves via su-exec, same as gitea itself needs.
+    command:
+      - "sh"
+      - "-c"
+      - >
+        su-exec git gitea admin user create --admin
+        --username "$GITEA_ADMIN_USER"
+        --password "$GITEA_ADMIN_PASSWORD"
+        --email "$GITEA_ADMIN_EMAIL"
+        --must-change-password=false
+        || echo "admin user already exists, skipping"
+    restart: "no"
+
+  # One-shot: creates the repo, labels, seed issues (Set A) and an API token for the app.
+  seed:
+    image: python:3.12-slim
+    depends_on:
+      gitea-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./seed:/seed:ro
+      - gitea-shared:/shared
+    working_dir: /seed
+    environment:
+      - GITEA_URL=http://gitea:3000
+      - GITEA_ADMIN_USER=${GITEA_ADMIN_USER}
+      - GITEA_ADMIN_PASSWORD=${GITEA_ADMIN_PASSWORD}
+      - GITEA_REPO_NAME=${GITEA_REPO_NAME}
+    command: ["sh", "-c", "pip install --no-cache-dir --quiet requests && python seed_gitea.py"]
+    restart: "no"
+
+  # One-off: classifies a report, checks for duplicates, and creates/comments on it in Gitea.
+  # Profile-gated so `docker compose up` doesn't start it - invoke explicitly, see README.
+  triage:
+    image: node:22-slim
+    container_name: triage
+    profiles: ["cli"]
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    volumes:
+      - ./service:/app
+      - gitea-shared:/shared:ro
+    working_dir: /app
+    # Lets the container reach an Ollama instance on the host (Linux needs the explicit mapping;
+    # Docker Desktop provides it already, where this is a harmless no-op).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - GITEA_URL=http://gitea:3000
+      - GITEA_OWNER=${GITEA_ADMIN_USER}
+      - GITEA_REPO_NAME=${GITEA_REPO_NAME}
+      - GITEA_TOKEN_FILE=/shared/gitea_token
+      # Provider switch: "openai" (default) or "ollama". Each backend's key/base-URL/model
+      # come from its own vars below; unset ones fall back to sensible defaults in src/infra/openai.ts.
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:latest}
+    # No build step: installs once per run, then execs the CLI with whatever args `run` was given.
+    entrypoint: ["sh", "-c", "npm install --no-audit --no-fund --silent && exec npx tsx src/main.ts \"$@\"", "--"]
+
+volumes:
+  gitea-data:
+  gitea-shared:
